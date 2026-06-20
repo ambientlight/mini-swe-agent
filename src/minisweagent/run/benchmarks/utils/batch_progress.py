@@ -56,7 +56,7 @@ class RunBatchProgressManager:
         self._instances_by_exit_status = collections.defaultdict(list)
         self._main_progress_bar = Progress(
             SpinnerColumn(spinner_name="dots2"),
-            TextColumn("[progress.description]{task.description} (${task.fields[total_cost]})"),
+            TextColumn("[progress.description]{task.description} (in {task.fields[in_tokens]} / out {task.fields[out_tokens]} tok)"),
             BarColumn(),
             MofNCompleteColumn(),
             TaskProgressColumn(),
@@ -70,13 +70,14 @@ class RunBatchProgressManager:
             TextColumn("{task.fields[instance_id]}"),
             TextColumn("{task.fields[status]}"),
             TimeElapsedColumn(),
+            TextColumn("[dim]{task.fields[stream_text]}[/dim]"),
         )
         """Task progress bar for individual instances. There's only one progress bar
         with one task for each instance.
         """
 
         self._main_task_id = self._main_progress_bar.add_task(
-            "[cyan]Overall Progress", total=num_instances, total_cost="0.00", eta=""
+            "[cyan]Overall Progress", total=num_instances, in_tokens="0", out_tokens="0", eta=""
         )
 
         self.render_group = Group(self._main_progress_bar, Table(), self._task_progress_bar)
@@ -116,9 +117,11 @@ class RunBatchProgressManager:
 
     def _update_total_costs(self) -> None:
         with self._lock:
+            stats = minisweagent.models.GLOBAL_MODEL_STATS
             self._main_progress_bar.update(
                 self._main_task_id,
-                total_cost=f"{minisweagent.models.GLOBAL_MODEL_STATS.cost:.2f}",
+                in_tokens=stats.format_prompt_tokens(),
+                out_tokens=stats.format_completion_tokens(),
                 eta=self._get_eta_text(),
             )
 
@@ -133,6 +136,14 @@ class RunBatchProgressManager:
             )
         self._update_total_costs()
 
+    def update_instance_stream_text(self, instance_id: str, text: str):
+        """Update the rolling reasoning/content snippet shown after the timer."""
+        if instance_id not in self._spinner_tasks:
+            return
+        snippet = text[-60:].replace("\n", " ").replace("\r", "").strip()
+        with self._lock:
+            self._task_progress_bar.update(self._spinner_tasks[instance_id], stream_text=snippet)
+
     def on_instance_start(self, instance_id: str):
         with self._lock:
             self._spinner_tasks[instance_id] = self._task_progress_bar.add_task(
@@ -140,6 +151,7 @@ class RunBatchProgressManager:
                 status="Task initialized",
                 total=None,
                 instance_id=instance_id,
+                stream_text="",
             )
 
     def on_instance_end(self, instance_id: str, exit_status: str | None) -> None:

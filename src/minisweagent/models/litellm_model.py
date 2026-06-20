@@ -58,11 +58,43 @@ class LitellmModel:
 
     def __init__(self, *, config_class: Callable = LitellmModelConfig, **kwargs):
         self.config = config_class(**kwargs)
+        # Optional live-progress hook: set by the runner to stream token count + text
+        # to the console. Signature: (completion_tokens: int, text: str) -> None.
+        self._progress_callback: Callable[[int, str], None] | None = None
         if self.config.litellm_model_registry and Path(self.config.litellm_model_registry).is_file():
             litellm.utils.register_model(json.loads(Path(self.config.litellm_model_registry).read_text()))
 
     def _query(self, messages: list[dict[str, str]], **kwargs):
         try:
+            if self._progress_callback is not None:
+                # Stream so the console can show live token accumulation + reasoning/
+                # content text. Chunks are reassembled into a normal (non-streaming)
+                # ModelResponse via litellm.stream_chunk_builder, so the rest of
+                # query() — tool-call parsing, cost, usage — is unchanged.
+                chunks = []
+                collected = []
+                n_tok = 0
+                stream = litellm.completion(
+                    model=self.config.model_name,
+                    messages=messages,
+                    tools=[BASH_TOOL],
+                    stream=True,
+                    stream_options={"include_usage": True},
+                    **(self.config.model_kwargs | kwargs),
+                )
+                for chunk in stream:
+                    chunks.append(chunk)
+                    delta = chunk.choices[0].delta if chunk.choices else None
+                    piece = ""
+                    if delta is not None:
+                        piece = (delta.content or "") or (getattr(delta, "reasoning_content", "") or "")
+                    if piece:
+                        collected.append(piece)
+                        n_tok += 1
+                        if n_tok % 10 == 0:
+                            self._progress_callback(n_tok, "".join(collected))
+                self._progress_callback(n_tok, "".join(collected))
+                return litellm.stream_chunk_builder(chunks, messages=messages)
             return litellm.completion(
                 model=self.config.model_name,
                 messages=messages,
@@ -83,7 +115,13 @@ class LitellmModel:
             with attempt:
                 response = self._query(self._prepare_messages_for_api(messages), **kwargs)
         cost_output = self._calculate_cost(response)
-        GLOBAL_MODEL_STATS.add(cost_output["cost"])
+        usage = getattr(response, "usage", None)
+        GLOBAL_MODEL_STATS.add(
+            cost_output["cost"],
+            prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+            completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+            total_tokens=getattr(usage, "total_tokens", 0) or 0,
+        )
         # Note: all model.query() implementations must persist the response on FormatError.
         try:
             actions = self._parse_actions(response)
