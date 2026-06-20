@@ -18,7 +18,7 @@ logger = logging.getLogger("litellm_response_api_model")
 
 
 class LitellmResponseAPIModelConfig(LitellmModelConfig):
-    pass
+    use_previous_response_id: bool = True  # Set to False for providers that don't support it (e.g., GitHub Copilot)
 
 
 class LitellmResponseAPIModel(LitellmModel):
@@ -47,13 +47,24 @@ class LitellmResponseAPIModel(LitellmModel):
         try:
             # Remove 'timestamp' field added by agent - not supported by OpenAI responses API
             clean_messages = [{"role": msg["role"], "content": msg["content"]} for msg in messages]
-            resp = litellm.responses(
-                model=self.config.model_name,
-                input=clean_messages if self._previous_response_id is None else clean_messages[-1:],
-                previous_response_id=self._previous_response_id,
+
+            # Build API call arguments
+            api_kwargs = {
+                "model": self.config.model_name,
                 **(self.config.model_kwargs | kwargs),
-            )
-            self._previous_response_id = getattr(resp, "id", None)
+            }
+
+            # Only use previous_response_id if enabled (some providers like GitHub Copilot don't support it)
+            if self.config.use_previous_response_id and self._previous_response_id is not None:
+                api_kwargs["input"] = clean_messages[-1:]
+                api_kwargs["previous_response_id"] = self._previous_response_id
+            else:
+                api_kwargs["input"] = clean_messages
+
+            resp = litellm.responses(**api_kwargs)
+
+            if self.config.use_previous_response_id:
+                self._previous_response_id = getattr(resp, "id", None)
             return resp
         except litellm.exceptions.AuthenticationError as e:
             e.message += " You can permanently set your API key with `mini-extra config set KEY VALUE`."

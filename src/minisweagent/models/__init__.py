@@ -16,17 +16,23 @@ class GlobalModelStats:
     def __init__(self):
         self._cost = 0.0
         self._n_calls = 0
+        self._total_tokens = 0
+        self._prompt_tokens = 0
+        self._completion_tokens = 0
         self._lock = threading.Lock()
         self.cost_limit = float(os.getenv("MSWEA_GLOBAL_COST_LIMIT", "0"))
         self.call_limit = int(os.getenv("MSWEA_GLOBAL_CALL_LIMIT", "0"))
         if (self.cost_limit > 0 or self.call_limit > 0) and not os.getenv("MSWEA_SILENT_STARTUP"):
             print(f"Global cost/call limit: ${self.cost_limit:.4f} / {self.call_limit}")
 
-    def add(self, cost: float) -> None:
-        """Add a model call with its cost, checking limits."""
+    def add(self, cost: float, prompt_tokens: int = 0, completion_tokens: int = 0, total_tokens: int = 0) -> None:
+        """Add a model call with its cost and token usage, checking limits."""
         with self._lock:
             self._cost += cost
             self._n_calls += 1
+            self._prompt_tokens += prompt_tokens
+            self._completion_tokens += completion_tokens
+            self._total_tokens += total_tokens
         if 0 < self.cost_limit < self._cost or 0 < self.call_limit < self._n_calls + 1:
             raise RuntimeError(f"Global cost/call limit exceeded: ${self._cost:.4f} / {self._n_calls + 1}")
 
@@ -37,6 +43,28 @@ class GlobalModelStats:
     @property
     def n_calls(self) -> int:
         return self._n_calls
+
+    @property
+    def total_tokens(self) -> int:
+        return self._total_tokens
+
+    @property
+    def prompt_tokens(self) -> int:
+        return self._prompt_tokens
+
+    @property
+    def completion_tokens(self) -> int:
+        return self._completion_tokens
+
+    def format_tokens(self) -> str:
+        """Format total tokens as human-readable string (e.g., '1.2k', '15.3M')."""
+        tokens = self._total_tokens
+        if tokens >= 1_000_000:
+            return f"{tokens / 1_000_000:.1f}M"
+        elif tokens >= 1000:
+            return f"{tokens / 1000:.1f}k"
+        else:
+            return str(tokens)
 
 
 GLOBAL_MODEL_STATS = GlobalModelStats()

@@ -36,6 +36,10 @@ class LitellmModel:
         self.config = config_class(**kwargs)
         self.cost = 0.0
         self.n_calls = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
+        self._progress_callback: Callable | None = None
         if self.config.litellm_model_registry and Path(self.config.litellm_model_registry).is_file():
             litellm.utils.register_model(json.loads(Path(self.config.litellm_model_registry).read_text()))
 
@@ -58,9 +62,42 @@ class LitellmModel:
     )
     def _query(self, messages: list[dict[str, str]], **kwargs):
         try:
-            return litellm.completion(
-                model=self.config.model_name, messages=messages, **(self.config.model_kwargs | kwargs)
-            )
+            if self._progress_callback is not None:
+                # Stream to show live token accumulation
+                response = litellm.completion(
+                    model=self.config.model_name, messages=messages,
+                    stream=True, **(self.config.model_kwargs | kwargs)
+                )
+                collected_content = []
+                token_count = 0
+                for chunk in response:
+                    delta = chunk.choices[0].delta
+                    if delta and delta.content:
+                        collected_content.append(delta.content)
+                        token_count += 1
+                        if token_count % 10 == 0:
+                            self._progress_callback(token_count, "".join(collected_content))
+                # Final callback
+                if self._progress_callback:
+                    self._progress_callback(token_count, "".join(collected_content))
+                # Reconstruct a non-streaming-style response
+                full_content = "".join(collected_content)
+                return litellm.utils.ModelResponse(
+                    choices=[litellm.utils.Choices(
+                        message=litellm.utils.Message(content=full_content, role="assistant"),
+                        index=0,
+                        finish_reason="stop",
+                    )],
+                    usage=litellm.utils.Usage(
+                        prompt_tokens=0,
+                        completion_tokens=token_count,
+                        total_tokens=token_count,
+                    ),
+                )
+            else:
+                return litellm.completion(
+                    model=self.config.model_name, messages=messages, **(self.config.model_kwargs | kwargs)
+                )
         except litellm.exceptions.AuthenticationError as e:
             e.message += " You can permanently set your API key with `mini-extra config set KEY VALUE`."
             raise e
@@ -88,7 +125,28 @@ class LitellmModel:
                 raise RuntimeError(msg) from e
         self.n_calls += 1
         self.cost += cost
-        GLOBAL_MODEL_STATS.add(cost)
+        # Track token usage
+        usage = getattr(response, "usage", None)
+        step_prompt_tokens = 0
+        step_completion_tokens = 0
+        step_total_tokens = 0
+        if usage:
+            prompt_tokens = getattr(usage, "prompt_tokens", 0)
+            completion_tokens = getattr(usage, "completion_tokens", 0)
+            total_tokens = getattr(usage, "total_tokens", 0)
+            # Handle cases where values might be None or non-integer (e.g., Mock objects in tests)
+            step_prompt_tokens = prompt_tokens if isinstance(prompt_tokens, int) else 0
+            step_completion_tokens = completion_tokens if isinstance(completion_tokens, int) else 0
+            step_total_tokens = total_tokens if isinstance(total_tokens, int) else 0
+            self.prompt_tokens += step_prompt_tokens
+            self.completion_tokens += step_completion_tokens
+            self.total_tokens += step_total_tokens
+        GLOBAL_MODEL_STATS.add(
+            cost,
+            prompt_tokens=step_prompt_tokens,
+            completion_tokens=step_completion_tokens,
+            total_tokens=step_total_tokens,
+        )
         return {
             "content": response.choices[0].message.content or "",  # type: ignore
             "extra": {

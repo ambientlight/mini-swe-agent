@@ -53,17 +53,63 @@ _OUTPUT_FILE_LOCK = threading.Lock()
 class ProgressTrackingAgent(DefaultAgent):
     """Simple wrapper around DefaultAgent that provides progress updates."""
 
-    def __init__(self, *args, progress_manager: RunBatchProgressManager, instance_id: str = "", **kwargs):
+    def __init__(
+        self,
+        *args,
+        progress_manager: RunBatchProgressManager,
+        instance_id: str = "",
+        traj_path: Path | None = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.progress_manager: RunBatchProgressManager = progress_manager
         self.instance_id = instance_id
+        self.traj_path = traj_path
+        # Wire up streaming progress callback
+        self.model._progress_callback = self._on_stream_token
+
+    def _on_stream_token(self, token_count: int, text: str):
+        """Called during streaming to show live token accumulation and text."""
+        total = self.model.total_tokens
+        if total >= 1000:
+            total_str = f" | {total / 1000:.1f}k tok"
+        elif total > 0:
+            total_str = f" | {total} tok"
+        else:
+            total_str = ""
+        self.progress_manager.update_instance_status(
+            self.instance_id, f"Step {self.model.n_calls:3d} | ⟳ {token_count} gen{total_str}"
+        )
+        self.progress_manager.update_instance_stream_text(self.instance_id, text)
 
     def step(self) -> dict:
-        """Override step to provide progress updates."""
+        """Override step to provide progress updates and save trajectory after each turn."""
+        if self.model.n_calls == 0:
+            self.progress_manager.update_instance_status(
+                self.instance_id, f"Step   0 | calling LLM..."
+            )
+        result = super().step()
+        # Format token count (e.g., 1234 -> "1.2k", 12345 -> "12k")
+        total_tokens = getattr(self.model, 'total_tokens', 0)
+        if total_tokens >= 1000:
+            tokens_str = f"{total_tokens / 1000:.1f}k"
+        else:
+            tokens_str = str(total_tokens)
         self.progress_manager.update_instance_status(
-            self.instance_id, f"Step {self.model.n_calls + 1:3d} (${self.model.cost:.2f})"
+            self.instance_id, f"Step {self.model.n_calls:3d} | {tokens_str} tok"
         )
-        return super().step()
+        self.progress_manager.update_instance_stream_text(self.instance_id, "")
+        # Save trajectory after each step for crash recovery / debugging
+        if self.traj_path is not None:
+            save_traj(
+                self,
+                self.traj_path,
+                exit_status="in_progress",
+                result="",
+                instance_id=self.instance_id,
+                print_path=False,
+            )
+        return result
 
 
 def get_swebench_docker_image_name(instance: dict) -> str:
@@ -128,9 +174,10 @@ def process_instance(
     """Process a single SWEBench instance."""
     instance_id = instance["instance_id"]
     instance_dir = output_dir / instance_id
+    traj_path = instance_dir / f"{instance_id}.traj.json"
     # avoid inconsistent state if something here fails and there's leftover previous files
     remove_from_preds_file(output_dir / "preds.json", instance_id)
-    (instance_dir / f"{instance_id}.traj.json").unlink(missing_ok=True)
+    traj_path.unlink(missing_ok=True)
     model = get_model(config=config.get("model", {}))
     task = instance["problem_statement"]
 
@@ -142,11 +189,13 @@ def process_instance(
 
     try:
         env = get_sb_environment(config, instance)
+        progress_manager.update_instance_status(instance_id, "Step   0 | starting")
         agent = ProgressTrackingAgent(
             model,
             env,
             progress_manager=progress_manager,
             instance_id=instance_id,
+            traj_path=traj_path,
             **config.get("agent", {}),
         )
         exit_status, result = agent.run(task)
@@ -157,7 +206,7 @@ def process_instance(
     finally:
         save_traj(
             agent,
-            instance_dir / f"{instance_id}.traj.json",
+            traj_path,
             exit_status=exit_status,
             result=result,
             extra_info=extra_info,
